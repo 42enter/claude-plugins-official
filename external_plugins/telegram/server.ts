@@ -808,7 +808,29 @@ bot.command('commands', async ctx => {
 })
 
 bot.on('message:text', async ctx => {
-  await handleInbound(ctx, ctx.message.text, undefined)
+  const text = ctx.message.text
+
+  // Route unhandled /commands to the tmux session as slash commands.
+  // Management commands (/clear, /compact, etc.) are already caught by
+  // bot.command() handlers above. This catches everything else like
+  // /review, /ship, /qa, /init, /commit, /browse, etc.
+  if (text.startsWith('/') && isAllowedDM(ctx)) {
+    const slashCmd = text.trim()
+    // Skip Telegram built-in commands handled above
+    const managed = ['start', 'help', 'status', 'clear', 'compact', 'screen',
+      'sessions', 'restart', 'send', 'session', 'commands']
+    const cmdName = slashCmd.slice(1).split(/[\s@]/)[0].toLowerCase()
+    if (!managed.includes(cmdName)) {
+      const tmpFile = `/tmp/tg-cmd-${Date.now()}.txt`
+      writeFileSync(tmpFile, slashCmd)
+      tmuxExec(`tmux load-buffer ${tmpFile} && tmux paste-buffer -t ${DEFAULT_SESSION} && rm ${tmpFile}`)
+      tmuxSendKeys(DEFAULT_SESSION, 'Enter')
+      await ctx.reply(`✓ Sent ${cmdName} to session "${DEFAULT_SESSION}"`)
+      return
+    }
+  }
+
+  await handleInbound(ctx, text, undefined)
 })
 
 bot.on('message:photo', async ctx => {
