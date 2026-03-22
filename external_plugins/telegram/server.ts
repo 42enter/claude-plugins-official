@@ -18,6 +18,7 @@ import {
 import { Bot, GrammyError, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
+import { execSync } from 'child_process'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
@@ -50,6 +51,27 @@ if (!TOKEN) {
   process.exit(1)
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+
+// ── Session management commands ──────────────────────────────────────
+// Bot commands that map to tmux session operations instead of forwarding to Claude Code.
+const DEFAULT_SESSION = process.env.CLAUDE_TMUX_SESSION ?? 'main-claude'
+
+function tmuxExec(cmd: string): string {
+  try {
+    return execSync(cmd, { encoding: 'utf8', timeout: 10000 }).trim()
+  } catch (err) {
+    const msg = err instanceof Error ? (err as any).stderr || err.message : String(err)
+    return `error: ${msg}`
+  }
+}
+
+function tmuxSendKeys(session: string, keys: string): string {
+  return tmuxExec(`tmux send-keys -t ${session} ${keys}`)
+}
+
+function tmuxCapture(session: string, lines = 40): string {
+  return tmuxExec(`tmux capture-pane -t ${session} -p -S -${lines}`)
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -635,6 +657,156 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
+// ── Session management bot commands ──────────────────────────────────
+// These intercept /commands before they reach Claude Code and route them
+// to tmux session operations. Only allowed from allowlisted DM users.
+
+function isAllowedDM(ctx: Context): boolean {
+  if (ctx.chat?.type !== 'private') return false
+  const from = ctx.from
+  if (!from) return false
+  const access = loadAccess()
+  return access.allowFrom.includes(String(from.id))
+}
+
+bot.command('clear', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  tmuxSendKeys(DEFAULT_SESSION, '"/clear" Enter')
+  await ctx.reply(`✓ Sent /clear to session "${DEFAULT_SESSION}"`)
+})
+
+bot.command('compact', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  tmuxSendKeys(DEFAULT_SESSION, '"/compact" Enter')
+  await ctx.reply(`✓ Sent /compact to session "${DEFAULT_SESSION}"`)
+})
+
+bot.command('screen', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  const session = ctx.match?.trim() || DEFAULT_SESSION
+  const output = tmuxCapture(session, 50)
+  const truncated = output.length > 3800 ? '…' + output.slice(-3800) : output
+  await ctx.reply(truncated || '(empty screen)')
+})
+
+bot.command('sessions', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  const output = tmuxExec('tmux list-sessions')
+  await ctx.reply(output || 'No tmux sessions found.')
+})
+
+bot.command('restart', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  const session = ctx.match?.trim() || DEFAULT_SESSION
+  tmuxExec(`tmux kill-session -t ${session} 2>/dev/null || true`)
+  const cmd = `tmux new-session -d -s ${session} 'claude --dangerously-skip-permissions --remote-control ${session} --name ${session}'`
+  tmuxExec(cmd)
+  setTimeout(() => {
+    tmuxExec(`tmux send-keys -t ${session} Enter`)
+  }, 2000)
+  await ctx.reply(`✓ Restarted session "${session}"`)
+})
+
+bot.command('send', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  const text = ctx.match?.trim()
+  if (!text) {
+    await ctx.reply('Usage: /send <text to type into session>')
+    return
+  }
+  const tmpFile = `/tmp/tg-send-${Date.now()}.txt`
+  writeFileSync(tmpFile, text)
+  tmuxExec(`tmux load-buffer ${tmpFile} && tmux paste-buffer -t ${DEFAULT_SESSION} && rm ${tmpFile}`)
+  tmuxSendKeys(DEFAULT_SESSION, 'Enter')
+  await ctx.reply(`✓ Sent to session "${DEFAULT_SESSION}"`)
+})
+
+bot.command('session', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  const args = ctx.match?.trim().split(/\s+/) || []
+  const subCmd = args[0]
+  const sessionName = args[1]
+
+  if (!subCmd) {
+    await ctx.reply(
+      'Session management:\n' +
+      '/session list — list all sessions\n' +
+      '/session screen <name> — view session output\n' +
+      '/session send <name> <text> — send text to session\n' +
+      '/session restart <name> — restart a session\n' +
+      '/session kill <name> — kill a session\n' +
+      '/session new <name> — create new Claude session'
+    )
+    return
+  }
+
+  switch (subCmd) {
+    case 'list': {
+      const output = tmuxExec('tmux list-sessions')
+      await ctx.reply(output || 'No sessions.')
+      break
+    }
+    case 'screen': {
+      if (!sessionName) { await ctx.reply('Usage: /session screen <name>'); return }
+      const output = tmuxCapture(sessionName, 50)
+      const truncated = output.length > 3800 ? '…' + output.slice(-3800) : output
+      await ctx.reply(truncated || '(empty)')
+      break
+    }
+    case 'send': {
+      if (!sessionName || args.length < 3) { await ctx.reply('Usage: /session send <name> <text>'); return }
+      const text = args.slice(2).join(' ')
+      const tmpFile = `/tmp/tg-send-${Date.now()}.txt`
+      writeFileSync(tmpFile, text)
+      tmuxExec(`tmux load-buffer ${tmpFile} && tmux paste-buffer -t ${sessionName} && rm ${tmpFile}`)
+      tmuxSendKeys(sessionName, 'Enter')
+      await ctx.reply(`✓ Sent to "${sessionName}"`)
+      break
+    }
+    case 'restart': {
+      if (!sessionName) { await ctx.reply('Usage: /session restart <name>'); return }
+      tmuxExec(`tmux kill-session -t ${sessionName} 2>/dev/null || true`)
+      const cmd = `tmux new-session -d -s ${sessionName} 'claude --dangerously-skip-permissions --remote-control ${sessionName} --name ${sessionName}'`
+      tmuxExec(cmd)
+      setTimeout(() => tmuxExec(`tmux send-keys -t ${sessionName} Enter`), 2000)
+      await ctx.reply(`✓ Restarted "${sessionName}"`)
+      break
+    }
+    case 'kill': {
+      if (!sessionName) { await ctx.reply('Usage: /session kill <name>'); return }
+      tmuxExec(`tmux kill-session -t ${sessionName}`)
+      await ctx.reply(`✓ Killed "${sessionName}"`)
+      break
+    }
+    case 'new': {
+      if (!sessionName) { await ctx.reply('Usage: /session new <name>'); return }
+      const cmd = `tmux new-session -d -s ${sessionName} 'claude --dangerously-skip-permissions --remote-control ${sessionName} --name ${sessionName}'`
+      const result = tmuxExec(cmd)
+      setTimeout(() => tmuxExec(`tmux send-keys -t ${sessionName} Enter`), 2000)
+      await ctx.reply(result || `✓ Created session "${sessionName}"`)
+      break
+    }
+    default:
+      await ctx.reply(`Unknown subcommand: ${subCmd}`)
+  }
+})
+
+bot.command('commands', async ctx => {
+  if (!isAllowedDM(ctx)) return
+  await ctx.reply(
+    '🔧 Session Commands:\n\n' +
+    '/clear — clear Claude conversation\n' +
+    '/compact — compact conversation\n' +
+    '/screen [session] — view session output\n' +
+    '/sessions — list all tmux sessions\n' +
+    '/restart [session] — restart a session\n' +
+    '/send <text> — send text to main session\n' +
+    '/session — session management submenu\n' +
+    '/commands — this help\n\n' +
+    'Default session: ' + DEFAULT_SESSION
+  )
+})
+
 bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
@@ -835,6 +1007,14 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              { command: 'clear', description: 'Clear Claude conversation' },
+              { command: 'compact', description: 'Compact conversation' },
+              { command: 'screen', description: 'View session output' },
+              { command: 'sessions', description: 'List tmux sessions' },
+              { command: 'restart', description: 'Restart a session' },
+              { command: 'send', description: 'Send text to session' },
+              { command: 'session', description: 'Session management' },
+              { command: 'commands', description: 'List all commands' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
