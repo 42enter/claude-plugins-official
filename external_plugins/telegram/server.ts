@@ -821,11 +821,14 @@ bot.on('message:text', async ctx => {
       'sessions', 'restart', 'send', 'session', 'commands']
     const cmdName = slashCmd.slice(1).split(/[\s@]/)[0].toLowerCase()
     if (!managed.includes(cmdName)) {
+      // Telegram bot commands use underscores; Claude Code uses hyphens.
+      // Convert /design_review → /design-review, /office_hours → /office-hours, etc.
+      const fixedCmd = slashCmd.replace(/^\/([a-z_]+)/, (_, name) => '/' + name.replace(/_/g, '-'))
       const tmpFile = `/tmp/tg-cmd-${Date.now()}.txt`
-      writeFileSync(tmpFile, slashCmd)
+      writeFileSync(tmpFile, fixedCmd)
       tmuxExec(`tmux load-buffer ${tmpFile} && tmux paste-buffer -t ${DEFAULT_SESSION} && rm ${tmpFile}`)
       tmuxSendKeys(DEFAULT_SESSION, 'Enter')
-      await ctx.reply(`✓ Sent ${cmdName} to session "${DEFAULT_SESSION}"`)
+      await ctx.reply(`✓ Sent ${fixedCmd.split(/\s/)[0]} to session "${DEFAULT_SESSION}"`)
       return
     }
   }
@@ -1026,9 +1029,11 @@ void (async () => {
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
             [
+              // Bot management
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              // Session management (handled by bot directly)
               { command: 'clear', description: 'Clear Claude conversation' },
               { command: 'compact', description: 'Compact conversation' },
               { command: 'screen', description: 'View session output' },
@@ -1037,6 +1042,22 @@ void (async () => {
               { command: 'send', description: 'Send text to session' },
               { command: 'session', description: 'Session management' },
               { command: 'commands', description: 'List all commands' },
+              // Claude Code slash commands (forwarded to session)
+              { command: 'init', description: 'Initialize CLAUDE.md' },
+              { command: 'review', description: 'Code review' },
+              { command: 'ship', description: 'Ship / create PR' },
+              { command: 'commit', description: 'Commit changes' },
+              { command: 'qa', description: 'QA testing' },
+              { command: 'browse', description: 'Browse a URL' },
+              { command: 'investigate', description: 'Debug errors' },
+              { command: 'design_review', description: 'Visual design audit' },
+              { command: 'retro', description: 'Weekly retrospective' },
+              { command: 'codex', description: 'Adversarial code review' },
+              { command: 'careful', description: 'Production safety mode' },
+              { command: 'freeze', description: 'Scope edits to one module' },
+              { command: 'guard', description: 'Maximum safety mode' },
+              { command: 'unfreeze', description: 'Remove edit restrictions' },
+              { command: 'office_hours', description: 'Brainstorm an idea' },
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
