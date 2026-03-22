@@ -73,6 +73,63 @@ function tmuxCapture(session: string, lines = 40): string {
   return tmuxExec(`tmux capture-pane -t ${session} -p -S -${lines}`)
 }
 
+// ── Auto-discover Claude Code slash commands ─────────────────────────
+// Extract name/description pairs from the claude binary at startup.
+// These get registered with BotFather for Telegram autocomplete.
+
+type BotCommand = { command: string; description: string }
+
+function discoverClaudeCommands(): BotCommand[] {
+  try {
+    const claudePath = execSync('which claude', { encoding: 'utf8', timeout: 5000 }).trim()
+    const raw = execSync(
+      `strings ${claudePath} | grep -oP 'name:"[a-z][-a-z]+",description:"[^"]*"'`,
+      { encoding: 'utf8', timeout: 15000 },
+    )
+    // Commands that don't make sense over Telegram (UI-only, local-only, or noise)
+    const exclude = new Set([
+      'chrome', 'claude-in-chrome', 'vim', 'voice', 'config', 'theme', 'color',
+      'heapdump', 'terminal', 'ide', 'keybindings', 'stickers', 'think-back',
+      'thinkback-play', 'web-setup', 'install', 'install-github-app',
+      'install-slack-app', 'doctor', 'debug', 'privacy-settings', 'upgrade',
+      'bridge-kick', 'extra-usage', 'logout', 'login', 'setup-browser-cookies',
+      'setup-deploy', 'gstack-upgrade', 'copy', 'help', 'init-verifiers',
+      // Generic names from bundled deps (sharp, slurm, nohup, etc.)
+      'sharp', 'sleep', 'srun', 'nohup', 'time', 'timeout', 'count',
+      'command', 'navigate', 'definition', 'duration', 'files', 'pyright',
+      'rename',
+    ])
+    // Commands we handle directly in the bot (don't forward)
+    const managed = new Set([
+      'start', 'help', 'status', 'clear', 'compact', 'screen',
+      'sessions', 'restart', 'send', 'session', 'commands',
+    ])
+    const seen = new Set<string>()
+    const commands: BotCommand[] = []
+
+    for (const line of raw.split('\n')) {
+      const m = line.match(/^name:"([^"]+)",description:"([^"]+)"$/)
+      if (!m) continue
+      const [, name, desc] = m
+      if (exclude.has(name) || managed.has(name) || seen.has(name)) continue
+      // Skip if description looks like bundled dep noise (very long or has newlines)
+      if (desc.length > 100 || desc.includes('\\n')) continue
+      seen.add(name)
+      // Telegram commands: lowercase + underscores only
+      const tgName = name.replace(/-/g, '_')
+      commands.push({ command: tgName, description: desc.slice(0, 256) })
+    }
+
+    process.stderr.write(`telegram channel: discovered ${commands.length} Claude Code commands\n`)
+    return commands
+  } catch (err) {
+    process.stderr.write(`telegram channel: command discovery failed: ${err}\n`)
+    return []
+  }
+}
+
+const discoveredCommands = discoverClaudeCommands()
+
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
@@ -1027,6 +1084,8 @@ void (async () => {
         onStart: info => {
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
+          // Register bot-managed + auto-discovered Claude Code commands
+          // Telegram caps setMyCommands at 100; we stay well under.
           void bot.api.setMyCommands(
             [
               // Bot management
@@ -1042,47 +1101,9 @@ void (async () => {
               { command: 'send', description: 'Send text to session' },
               { command: 'session', description: 'Session management' },
               { command: 'commands', description: 'List all commands' },
-              // Claude Code built-in commands (forwarded to session)
-              { command: 'init', description: 'Initialize CLAUDE.md' },
-              { command: 'btw', description: 'Quick side question without interrupting' },
-              { command: 'commit', description: 'Create a git commit' },
-              { command: 'commit_push_pr', description: 'Commit, push, and open a PR' },
-              { command: 'cost', description: 'Show session cost and duration' },
-              { command: 'diff', description: 'View uncommitted changes' },
-              { command: 'effort', description: 'Set effort level' },
-              { command: 'export', description: 'Export conversation to file' },
-              { command: 'files', description: 'List files in context' },
-              { command: 'plan', description: 'Enable plan mode or view plan' },
-              { command: 'pr_comments', description: 'Get PR comments from GitHub' },
-              { command: 'resume', description: 'Resume a previous conversation' },
-              { command: 'review', description: 'Review a pull request' },
-              { command: 'context', description: 'Visualize context usage' },
-              { command: 'reload_plugins', description: 'Reload plugins in session' },
-              { command: 'stats', description: 'Show usage statistics' },
-              // gstack / skill commands (forwarded to session)
-              { command: 'browse', description: 'Browse a URL' },
-              { command: 'qa', description: 'QA testing' },
-              { command: 'ship', description: 'Ship / create PR' },
-              { command: 'land_and_deploy', description: 'Land and deploy changes' },
-              { command: 'investigate', description: 'Debug errors' },
-              { command: 'design_review', description: 'Visual design audit' },
-              { command: 'design_consultation', description: 'Create a design system' },
-              { command: 'retro', description: 'Weekly retrospective' },
-              { command: 'codex', description: 'Adversarial code review' },
-              { command: 'careful', description: 'Production safety mode' },
-              { command: 'freeze', description: 'Scope edits to one module' },
-              { command: 'guard', description: 'Maximum safety mode' },
-              { command: 'unfreeze', description: 'Remove edit restrictions' },
-              { command: 'office_hours', description: 'Brainstorm an idea' },
-              { command: 'plan_ceo_review', description: 'Strategy review of a plan' },
-              { command: 'plan_eng_review', description: 'Architecture review of a plan' },
-              { command: 'plan_design_review', description: 'Design review of a plan' },
-              { command: 'simplify', description: 'Review code for quality and efficiency' },
-              { command: 'document_release', description: 'Post-ship doc updates' },
-              { command: 'security_review', description: 'Security review of pending changes' },
-              { command: 'batch', description: 'Plan and execute large-scale change in parallel' },
-              { command: 'loop', description: 'Run a command on recurring interval' },
-            ],
+              // Auto-discovered from claude binary
+              ...discoveredCommands,
+            ].slice(0, 100), // Telegram hard limit
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
         },
